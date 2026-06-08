@@ -228,8 +228,21 @@ hardware_interface::CallbackReturn OpenArmHW::on_activate(
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
 
-  // Return to zero position
-  return_to_zero();
+  // Seed commands with current position to prevent unintended motion on
+  // activation
+  const auto& arm_motors = openarm_->get_arm().get_motors();
+  for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
+    pos_states_[i] = arm_motors[i].get_position();
+    pos_commands_[i] = arm_motors[i].get_position();
+  }
+  if (hand_) {
+    const auto& gripper_motors = openarm_->get_gripper().get_motors();
+    if (!gripper_motors.empty()) {
+      pos_states_[ARM_DOF] =
+          motor_radians_to_joint(gripper_motors[0].get_position());
+      pos_commands_[ARM_DOF] = pos_states_[ARM_DOF];
+    }
+  }
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "OpenArm V10 activated");
   return CallbackReturn::SUCCESS;
