@@ -38,9 +38,9 @@ namespace openarm_hardware {
  * following the pattern from full_arm.cpp example. Much simpler than
  * the original implementation.
  */
-class OpenArm_v10HW : public hardware_interface::SystemInterface {
+class OpenArmHW : public hardware_interface::SystemInterface {
  public:
-  OpenArm_v10HW();
+  OpenArmHW();
 
   TEMPLATES__ROS2_CONTROL__VISIBILITY_PUBLIC
   hardware_interface::CallbackReturn on_init(
@@ -117,6 +117,7 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // Configuration
   std::string can_interface_;
   std::string arm_prefix_;
+  std::string ee_type_;
   bool hand_;
   bool can_fd_;
 
@@ -133,6 +134,16 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   std::vector<double> pos_states_;
   std::vector<double> vel_states_;
   std::vector<double> tau_states_;
+
+  static constexpr std::array<double, ARM_DOF> ZERO_POSITION = {
+      0.0,  // joint1
+      0.0,  // joint2
+      0.0,  // joint3
+      0.0,  // joint4
+      0.0,  // joint5
+      0.0,  // joint6
+      0.0,  // joint7
+  };
 
   // Helper methods
   void return_to_zero();
