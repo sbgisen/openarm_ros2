@@ -114,6 +114,16 @@ class OpenArmHW : public hardware_interface::SystemInterface {
   double gripper_kp_ = GRIPPER_KP;
   double gripper_kd_ = GRIPPER_KD;
 
+  // Encoder calibration from the URDF <param name="lb_encoder"/"ub_encoder">
+  // (7 arm joints + gripper). When absent the offsets stay zero and the
+  // gripper keeps the default motor map, i.e. firmware-zeroed behavior.
+  std::vector<double> lb_encoder_;
+  std::vector<double> ub_encoder_;
+  std::vector<double> pos_offsets_ = std::vector<double>(ARM_DOF, 0.0);
+  bool calibrated_ = false;
+  double gripper_motor_open_rad_ = GRIPPER_MOTOR_1_RADIANS;
+  double gripper_motor_closed_rad_ = GRIPPER_MOTOR_0_RADIANS;
+
   // Configuration
   std::string can_interface_;
   std::string arm_prefix_;
@@ -148,6 +158,8 @@ class OpenArmHW : public hardware_interface::SystemInterface {
   // Helper methods
   void return_to_zero();
   bool parse_config(const hardware_interface::HardwareInfo& info);
+  bool parse_encoder_calibration(const hardware_interface::HardwareInfo& info);
+  bool compute_offsets(const hardware_interface::HardwareInfo& info);
   void generate_joint_names();
 
   // Gripper mapping functions

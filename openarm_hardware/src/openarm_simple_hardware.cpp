@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -25,6 +26,34 @@
 #include "rclcpp/rclcpp.hpp"
 
 namespace openarm_hardware {
+
+namespace {
+
+// Parse a whitespace-separated list of doubles, e.g. "0.1 -0.2 0.3".
+bool parse_double_list(const std::string& text, const std::string& name,
+                       size_t expected, std::vector<double>& out) {
+  out.clear();
+  std::istringstream stream(text);
+  double value;
+  while (stream >> value) {
+    out.push_back(value);
+  }
+  if (!stream.eof()) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                 "Parameter %s contains a non-numeric token: '%s'",
+                 name.c_str(), text.c_str());
+    return false;
+  }
+  if (out.size() != expected) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                 "Parameter %s has %zu values, expected %zu", name.c_str(),
+                 out.size(), expected);
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
 
 OpenArmHW::OpenArmHW() = default;
 
@@ -90,6 +119,90 @@ bool OpenArmHW::parse_config(const hardware_interface::HardwareInfo& info) {
               "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s",
               can_interface_.c_str(), arm_prefix_.c_str(),
               hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled");
+  return parse_encoder_calibration(info);
+}
+
+bool OpenArmHW::parse_encoder_calibration(
+    const hardware_interface::HardwareInfo& info) {
+  auto lb_it = info.hardware_parameters.find("lb_encoder");
+  auto ub_it = info.hardware_parameters.find("ub_encoder");
+  const bool has_lb = lb_it != info.hardware_parameters.end();
+  const bool has_ub = ub_it != info.hardware_parameters.end();
+
+  if (!has_lb && !has_ub) {
+    RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
+                "No lb_encoder/ub_encoder calibration parameters; assuming "
+                "firmware-zeroed motors (zero offsets, default gripper map)");
+    return true;
+  }
+  if (has_lb != has_ub) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                 "lb_encoder and ub_encoder must both be set; only %s found",
+                 has_lb ? "lb_encoder" : "ub_encoder");
+    return false;
+  }
+
+  const size_t n_motors = ARM_DOF + 1;  // gripper always included
+  if (!parse_double_list(lb_it->second, "lb_encoder", n_motors, lb_encoder_) ||
+      !parse_double_list(ub_it->second, "ub_encoder", n_motors, ub_encoder_)) {
+    return false;
+  }
+  for (size_t i = 0; i < n_motors; ++i) {
+    if (lb_encoder_[i] > ub_encoder_[i]) {
+      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                   "lb_encoder[%zu]=%.6f exceeds ub_encoder[%zu]=%.6f", i,
+                   lb_encoder_[i], i, ub_encoder_[i]);
+      return false;
+    }
+  }
+
+  if (hand_) {
+    if (ee_type_ == "pinch_gripper") {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
+                  "Gripper encoder calibration is ignored for ee_type "
+                  "pinch_gripper");
+    } else {
+      if (ub_encoder_[ARM_DOF] - lb_encoder_[ARM_DOF] < 1e-6) {
+        RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                     "Gripper encoder span [%.6f, %.6f] is degenerate",
+                     lb_encoder_[ARM_DOF], ub_encoder_[ARM_DOF]);
+        return false;
+      }
+      // Motor angle decreases as the gripper opens (default open map is
+      // -1.0472), so the swept minimum is open and the maximum is closed.
+      gripper_motor_open_rad_ = lb_encoder_[ARM_DOF];
+      gripper_motor_closed_rad_ = ub_encoder_[ARM_DOF];
+    }
+  }
+
+  calibrated_ = true;
+  return true;
+}
+
+bool OpenArmHW::compute_offsets(const hardware_interface::HardwareInfo& info) {
+  if (!calibrated_) {
+    return true;
+  }
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    auto it = info.limits.find(joint_names_[i]);
+    if (it == info.limits.end() || !it->second.has_position_limits) {
+      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                   "Joint %s has no URDF position limits; cannot compute "
+                   "calibration offset",
+                   joint_names_[i].c_str());
+      return false;
+    }
+    pos_offsets_[i] = it->second.min_position - lb_encoder_[i];
+    RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+                "%s: lb_encoder=%.4f urdf_lb=%.4f offset=%.4f",
+                joint_names_[i].c_str(), lb_encoder_[i],
+                it->second.min_position, pos_offsets_[i]);
+  }
+  if (hand_ && ee_type_ != "pinch_gripper") {
+    RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+                "Gripper motor map: open(lb)=%.4f closed(ub)=%.4f",
+                gripper_motor_open_rad_, gripper_motor_closed_rad_);
+  }
   return true;
 }
 
@@ -140,6 +253,11 @@ hardware_interface::CallbackReturn OpenArmHW::on_init(
     RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
                  "Generated %zu joint names, expected %zu", joint_names_.size(),
                  expected_joints);
+    return CallbackReturn::ERROR;
+  }
+
+  // Compute calibration offsets (needs joint names to look up URDF limits)
+  if (!compute_offsets(info)) {
     return CallbackReturn::ERROR;
   }
 
@@ -232,8 +350,8 @@ hardware_interface::CallbackReturn OpenArmHW::on_activate(
   // activation
   const auto& arm_motors = openarm_->get_arm().get_motors();
   for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
-    pos_states_[i] = arm_motors[i].get_position();
-    pos_commands_[i] = arm_motors[i].get_position();
+    pos_states_[i] = arm_motors[i].get_position() + pos_offsets_[i];
+    pos_commands_[i] = pos_states_[i];
   }
   if (hand_) {
     const auto& gripper_motors = openarm_->get_gripper().get_motors();
@@ -272,7 +390,7 @@ hardware_interface::return_type OpenArmHW::read(
   // Read arm joint states
   const auto& arm_motors = openarm_->get_arm().get_motors();
   for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
-    pos_states_[i] = arm_motors[i].get_position();
+    pos_states_[i] = arm_motors[i].get_position() + pos_offsets_[i];
     vel_states_[i] = arm_motors[i].get_velocity();
     tau_states_[i] = arm_motors[i].get_torque();
   }
@@ -300,8 +418,8 @@ hardware_interface::return_type OpenArmHW::write(
   // Control arm motors with MIT control
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    arm_params.push_back(
-        {kp_[i], kd_[i], pos_commands_[i], vel_commands_[i], tau_commands_[i]});
+    arm_params.push_back({kp_[i], kd_[i], pos_commands_[i] - pos_offsets_[i],
+                          vel_commands_[i], tau_commands_[i]});
   }
   openarm_->get_arm().mit_control_all(arm_params);
   // Control gripper if enabled
@@ -390,8 +508,11 @@ double OpenArmHW::joint_to_motor_radians(double joint_value) {
     // revolute: joint 0-1.5708 rad -> motor 0-1.5708
     return joint_value;
   } else {
-    // parallel_link (prismatic): 0-0.044m -> 0 to -1.0472 rad
-    return (joint_value / GRIPPER_JOINT_0_POSITION) * GRIPPER_MOTOR_1_RADIANS;
+    // parallel_link (prismatic): joint 0 m (closed) -> closed motor angle,
+    // 0.044 m (open) -> open motor angle
+    return gripper_motor_closed_rad_ +
+           (joint_value / GRIPPER_JOINT_0_POSITION) *
+               (gripper_motor_open_rad_ - gripper_motor_closed_rad_);
   }
 }
 
@@ -401,7 +522,9 @@ double OpenArmHW::motor_radians_to_joint(double motor_radians) {
     return motor_radians;
   } else {
     // parallel_link (prismatic)
-    return GRIPPER_JOINT_0_POSITION * (motor_radians / GRIPPER_MOTOR_1_RADIANS);
+    return GRIPPER_JOINT_0_POSITION *
+           (motor_radians - gripper_motor_closed_rad_) /
+           (gripper_motor_open_rad_ - gripper_motor_closed_rad_);
   }
 }
 
